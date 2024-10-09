@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Lambda function with S3 and DynamoDB access
+
+Parameters:
+  ExistingBucketName:
+    Type: String
+    Description: Name of the existing S3 bucket to use
+
+Resources:
+  AppDynamoDBTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey:
+        Name: id
+        Type: String
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  S3JsonLoggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/s3-json-logger.s3JsonLoggerHandler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 60
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ExistingBucketName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AppDynamoDBTable
+      Environment:
+        Variables:
+          APPDYNAMODBTABLE_TABLE_NAME: !Ref AppDynamoDBTable
+          APPDYNAMODBTABLE_TABLE_ARN: !GetAtt AppDynamoDBTable.Arn
+          S3_BUCKET_NAME: !Ref ExistingBucketName
+
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3JsonLoggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::${ExistingBucketName}
+
+  S3BucketNotification:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt S3BucketNotificationFunction.Arn
+      BucketName: !Ref ExistingBucketName
+      LambdaFunctionArn: !GetAtt S3JsonLoggerFunction.Arn
+      NotificationEvents:
+        - s3:ObjectCreated:*
+      FilterRules:
+        - Name: suffix
+          Value: .csv
+
+  S3BucketNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              bucket_name = event['ResourceProperties']['BucketName']
+              lambda_arn = event['ResourceProperties']['LambdaFunctionArn']
+              notification_events = event['ResourceProperties']['NotificationEvents']
+              filter_rules = event['ResourceProperties']['FilterRules']
+              try:
+                  response = s3.put_bucket_notification_configuration(
+                      Bucket=bucket_name,
+                      NotificationConfiguration={
+                          'LambdaFunctionConfigurations': [
+                              {
+                                  'LambdaFunctionArn': lambda_arn,
+                                  'Events': notification_events,
+                                  'Filter': {
+                                      'Key': {
+                                          'FilterRules': filter_rules
+                                      }
+                                  }
+                              }
+                          ]
+                      }
+                  )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, '')
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, str(e))
+
+      Handler: index.handler
+      Runtime: python3.9
+      Role: !GetAtt S3BucketNotificationFunctionRole.Arn
+
+  S3BucketNotificationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3BucketNotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotificationConfiguration
+                Resource: !Sub arn:aws:s3:::${ExistingBucketName}
+
+  ApplicationResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name: !Sub ApplicationInsights-SAM-${AWS::StackName}
+      ResourceQuery:
+        Type: CLOUDFORMATION_STACK_1_0
+
+  ApplicationInsightsMonitoring:
+    Type: AWS::ApplicationInsights::Application
+    Properties:
+      ResourceGroupName: !Ref ApplicationResourceGroup
+      AutoConfigurationEnabled: true
+
+Globals:
+  Function:
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+  Api:
+    TracingEnabled: true
